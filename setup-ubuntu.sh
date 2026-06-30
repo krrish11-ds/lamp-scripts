@@ -718,10 +718,23 @@ if confirm "Install MongoDB?"; then
     # Default port 27017 — bind localhost only (secure by default)
     sed -i "s/bindIp: 127.0.0.1/bindIp: 127.0.0.1/" /etc/mongod.conf
 
+    MONGO_PORT=27017
+    if confirm "Use a custom port instead of the default (${MONGO_PORT})?"; then
+        while true; do
+            read -rp "  Enter custom port for MongoDB: " custom_port
+            if [[ "$custom_port" =~ ^[0-9]+$ ]] && (( custom_port >= 1 && custom_port <= 65535 )); then
+                MONGO_PORT="$custom_port"
+                break
+            fi
+            echo -e "  ${RED}Invalid port — enter a number between 1 and 65535.${RESET}"
+        done
+        sed -i "s/^  port: .*/  port: ${MONGO_PORT}/" /etc/mongod.conf
+    fi
+
     systemctl enable --now mongod
     check_service mongod "MongoDB"
-    # Port 27017 NOT opened in firewall — localhost only is secure default
-    info "MongoDB running on default port 27017 (localhost only — not exposed to internet)"
+    # Port NOT opened in firewall — localhost only is secure default
+    info "MongoDB running on port ${MONGO_PORT} (localhost only — not exposed to internet)"
     warn "Create admin user BEFORE enabling auth — see docs"
 fi
 
@@ -754,15 +767,35 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
     # Refresh only pgdg — ignore any unrelated repo errors (e.g. MySQL GPG)
     run_spin "Refreshing apt" apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/pgdg.list"         -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
 
+    if confirm "Use custom port(s) instead of the automatic defaults (5432, 5433, ...)?"; then
+        USE_CUSTOM_PG_PORT=true
+        while true; do
+            read -rp "  Enter starting port (subsequent versions get +1 each): " pg_start_port
+            if [[ "$pg_start_port" =~ ^[0-9]+$ ]] && (( pg_start_port >= 1 && pg_start_port <= 65535 )); then
+                break
+            fi
+            echo -e "  ${RED}Invalid port — enter a number between 1 and 65535.${RESET}"
+        done
+    else
+        USE_CUSTOM_PG_PORT=false
+    fi
+
     # Install each selected major version. The postgresql-common package
     # auto-creates a separate cluster per version (pg_createcluster) and
     # assigns each one the next free port automatically (5432, 5433, ...)
     # — so multiple major versions genuinely run side by side here.
     INSTALLED_PG_VERSIONS=()
+    pg_next_port="${pg_start_port:-5432}"
     for PG_NUM in "${PG_VERSIONS[@]}"; do
         if run_spin "Installing PostgreSQL ${PG_NUM}" apt-get install -y -qq \
             postgresql-${PG_NUM} postgresql-client-${PG_NUM}; then
             INSTALLED_PG_VERSIONS+=("$PG_NUM")
+            if $USE_CUSTOM_PG_PORT; then
+                pg_conftool "$PG_NUM" main set port "$pg_next_port" &>/dev/null
+                systemctl restart "postgresql@${PG_NUM}-main" &>/dev/null
+                info "PostgreSQL ${PG_NUM} cluster set to port ${pg_next_port}"
+                pg_next_port=$((pg_next_port+1))
+            fi
         fi
     done
 
@@ -781,9 +814,161 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
 fi
 
 # ════════════════════════════════════════════════════════════
-#  SECTION 8 — SSL via Let's Encrypt (always installed)
+#  SECTION 8 — Node.js (multi-version via nvm, like PHP)
 # ════════════════════════════════════════════════════════════
-step "STEP 7 — SSL via Let's Encrypt (Certbot)"
+step "STEP 7 — Node.js"
+
+if confirm "Install Node.js?"; then
+    pick_multi "Select Node.js version(s) to install:" \
+        "Node 18 (LTS - Maintenance)" \
+        "Node 20 (LTS)" \
+        "Node 22 (LTS)" \
+        "Node 24 (Current)"
+
+    NODE_VERSIONS=()
+    for p in "${PICKS[@]}"; do
+        v=$(echo "$p" | grep -oP '\d+' | head -1)
+        NODE_VERSIONS+=("$v")
+    done
+
+    if [[ ${#NODE_VERSIONS[@]} -eq 0 ]]; then
+        warn "No Node.js version selected — skipping."
+    else
+        # System-wide nvm install (not per-user ~/.nvm) so every user/shell
+        # — and non-interactive contexts via the symlink below — can see it.
+        export NVM_DIR="/usr/local/nvm"
+        mkdir -p "$NVM_DIR"
+        if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
+            run_spin "Installing nvm" bash -c \
+                "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | NVM_DIR=$NVM_DIR bash"
+        fi
+        # shellcheck disable=SC1091
+        source "$NVM_DIR/nvm.sh"
+
+        # Make nvm available in every login shell
+        cat > /etc/profile.d/nvm.sh << EOF
+export NVM_DIR="/usr/local/nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
+EOF
+
+        INSTALLED_NODE_VERSIONS=()
+        for ver in "${NODE_VERSIONS[@]}"; do
+            info "Installing Node.js ${ver}..."
+            if nvm install "$ver" >> /tmp/stack_install.log 2>&1; then
+                INSTALLED_NODE_VERSIONS+=("$ver")
+                success "Node.js ${ver} installed"
+            else
+                warn "Node.js ${ver} install FAILED — see /tmp/stack_install.log"
+            fi
+        done
+        > /tmp/stack_install.log
+
+        if [[ ${#INSTALLED_NODE_VERSIONS[@]} -gt 0 ]]; then
+            echo ""
+            DEFAULT_NODE_OPTS=()
+            for ver in "${INSTALLED_NODE_VERSIONS[@]}"; do
+                DEFAULT_NODE_OPTS+=("Node ${ver}")
+            done
+            pick_one "Which installed Node.js version should be the DEFAULT?" "${DEFAULT_NODE_OPTS[@]}"
+            DEFAULT_NODE=$(echo "$PICK" | grep -oP '\d+' | head -1)
+            nvm alias default "$DEFAULT_NODE" &>/dev/null
+
+            # nvm only works in interactive bash shells. For system-wide
+            # access (cron, systemd units, other shells), symlink the
+            # default version's node/npm/npx into /usr/local/bin.
+            NODE_BIN_DIR=$(dirname "$(nvm which "$DEFAULT_NODE")")
+            for bin in node npm npx; do
+                [[ -x "${NODE_BIN_DIR}/${bin}" ]] && ln -sf "${NODE_BIN_DIR}/${bin}" "/usr/local/bin/${bin}"
+            done
+            success "Default Node.js -> ${DEFAULT_NODE}  (change later with: nvm alias default <version>)"
+
+            echo ""
+            info "Installed Node.js versions summary:"
+            for ver in "${INSTALLED_NODE_VERSIONS[@]}"; do
+                if [[ "$ver" == "$DEFAULT_NODE" ]]; then
+                    echo -e "  ${GREEN}●${RESET} ${BOLD}${ver}${RESET} (default/active)"
+                else
+                    echo -e "  ${CYAN}●${RESET} ${ver} (installed via nvm)"
+                fi
+            done
+        fi
+    fi
+fi
+
+# ════════════════════════════════════════════════════════════
+#  SECTION 9 — Python (multi-version via deadsnakes, like PHP)
+# ════════════════════════════════════════════════════════════
+step "STEP 8 — Python"
+
+if confirm "Install additional Python version(s)?"; then
+    pick_multi "Select Python version(s) to install alongside the system Python:" \
+        "Python 3.9" "Python 3.10" "Python 3.11" "Python 3.12" "Python 3.13" "Python 3.14"
+
+    PYTHON_VERSIONS=()
+    for p in "${PICKS[@]}"; do
+        v=$(echo "$p" | grep -oP '[\d.]+' | head -1)
+        PYTHON_VERSIONS+=("$v")
+    done
+
+    if [[ ${#PYTHON_VERSIONS[@]} -eq 0 ]]; then
+        warn "No Python version selected — skipping."
+    else
+        run_spin "Adding deadsnakes/ppa" add-apt-repository -y ppa:deadsnakes/ppa
+        run_spin "Refreshing apt" apt-get update -qq
+
+        INSTALLED_PYTHON_VERSIONS=()
+        for ver in "${PYTHON_VERSIONS[@]}"; do
+            if run_spin "Installing Python ${ver}" apt-get install -y -qq \
+                "python${ver}" "python${ver}-venv" "python${ver}-dev"; then
+                INSTALLED_PYTHON_VERSIONS+=("$ver")
+            else
+                warn "Python ${ver} not available for ${OS_CODENAME} (Ubuntu may already ship it as the system default) — skipped"
+            fi
+        done
+
+        if [[ ${#INSTALLED_PYTHON_VERSIONS[@]} -gt 0 ]]; then
+            echo ""
+            DEFAULT_PY_OPTS=()
+            for ver in "${INSTALLED_PYTHON_VERSIONS[@]}"; do
+                DEFAULT_PY_OPTS+=("Python ${ver}")
+            done
+            pick_one "Which installed Python version should the plain 'python' command point to?" "${DEFAULT_PY_OPTS[@]}"
+            DEFAULT_PYTHON=$(echo "$PICK" | grep -oP '[\d.]+' | head -1)
+
+            # IMPORTANT: we only ever touch the bare `python` alternative —
+            # NEVER `python3`. Ubuntu's apt/system tooling depends on
+            # /usr/bin/python3 pointing at the OS-owned interpreter; relinking
+            # it breaks apt and other system scripts. `python3.9`..`python3.14`
+            # binaries remain independently callable regardless of this setting.
+            ALT_PRIORITY=10
+            for ver in "${INSTALLED_PYTHON_VERSIONS[@]}"; do
+                bin="/usr/bin/python${ver}"
+                if [[ -x "$bin" ]]; then
+                    update-alternatives --install /usr/bin/python python "$bin" "$ALT_PRIORITY" &>/dev/null
+                    ALT_PRIORITY=$((ALT_PRIORITY+10))
+                fi
+            done
+            update-alternatives --set python "/usr/bin/python${DEFAULT_PYTHON}" &>/dev/null
+            success "'python' -> Python ${DEFAULT_PYTHON}  (change later with: sudo update-alternatives --config python)"
+            info "'python3' is left untouched — it stays the Ubuntu system interpreter."
+
+            echo ""
+            info "Installed Python versions summary:"
+            for ver in "${INSTALLED_PYTHON_VERSIONS[@]}"; do
+                if [[ "$ver" == "$DEFAULT_PYTHON" ]]; then
+                    echo -e "  ${GREEN}●${RESET} ${BOLD}${ver}${RESET} (default for 'python')"
+                else
+                    echo -e "  ${CYAN}●${RESET} ${ver} (call directly as python${ver})"
+                fi
+            done
+        fi
+    fi
+fi
+
+# ════════════════════════════════════════════════════════════
+#  SECTION 10 — SSL via Let's Encrypt (always installed)
+# ════════════════════════════════════════════════════════════
+step "STEP 9 — SSL via Let's Encrypt (Certbot)"
 
 info "Installing Certbot for Let's Encrypt SSL..."
 
@@ -868,6 +1053,8 @@ command -v mariadb &>/dev/null &&     echo -e "  ${GREEN}●${RESET}  MariaDB  :
 command -v psql    &>/dev/null &&     echo -e "  ${GREEN}●${RESET}  Postgres : $(psql --version 2>&1)"
 command -v mongod  &>/dev/null &&     echo -e "  ${GREEN}●${RESET}  MongoDB  : $(mongod --version 2>&1 | head -1)"
 command -v certbot &>/dev/null &&     echo -e "  ${GREEN}●${RESET}  Certbot  : $(certbot --version 2>&1)"
+[[ -x /usr/local/bin/node ]] &&     echo -e "  ${GREEN}●${RESET}  Node     : $(/usr/local/bin/node --version 2>&1) (default)"
+command -v python &>/dev/null &&     echo -e "  ${GREEN}●${RESET}  python   : $(python --version 2>&1) (default alternative)"
 
 # PHP versions + loaded extensions
 echo ""
