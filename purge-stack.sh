@@ -111,5 +111,5 @@ cat << 'DONE'
   ╚══════════════════════════════════════════════════════╝
 DONE
 echo -e "${RESET}"
-echo -e "  ${DIM}Ab yeh chalao: sudo bash setup-ubuntu.sh${RESET}"
+echo -e "  ${DIM}Now run: sudo bash setup-ubuntu.sh${RESET}"
 echo ""
