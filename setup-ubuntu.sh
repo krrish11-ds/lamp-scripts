@@ -93,6 +93,29 @@ confirm() {
     done
 }
 
+# ── prompt_password: asks twice, validates match, stores in $PROMPT_PASSWORD ──
+prompt_password() {
+    local label="$1"
+    while true; do
+        read -rsp "  Enter password for ${label}: " p1; echo
+        if [[ -z "$p1" ]]; then
+            echo -e "  ${RED}Password cannot be empty.${RESET}"; continue
+        fi
+        read -rsp "  Confirm password: " p2; echo
+        if [[ "$p1" != "$p2" ]]; then
+            echo -e "  ${RED}Passwords do not match — try again.${RESET}"; continue
+        fi
+        PROMPT_PASSWORD="$p1"
+        return
+    done
+}
+
+# ── save_credential: appends "label: value" to the credentials file ──
+save_credential() {
+    touch /root/stack-credentials.txt && chmod 600 /root/stack-credentials.txt
+    echo "$1: $2" >> /root/stack-credentials.txt
+}
+
 # ── pick_one: single numbered choice ─────────────────────────
 pick_one() {
     local prompt="$1"; shift; local opts=("$@")
@@ -592,19 +615,8 @@ if confirm "Install MySQL or MariaDB?"; then
     # ── Helper: prompt for a root password and apply it ──
     set_db_root_password() {
         local service="$1" label="$2"
-        local pass1 pass2
-
-        while true; do
-            read -rsp "  Enter root password for ${label}: " pass1; echo
-            if [[ -z "$pass1" ]]; then
-                echo -e "  ${RED}Password cannot be empty.${RESET}"; continue
-            fi
-            read -rsp "  Confirm password: " pass2; echo
-            if [[ "$pass1" != "$pass2" ]]; then
-                echo -e "  ${RED}Passwords do not match — try again.${RESET}"; continue
-            fi
-            break
-        done
+        prompt_password "${label} root"
+        local pass1="$PROMPT_PASSWORD"
 
         if [[ "$service" == "mariadb" ]]; then
             mysql -u root -e \
@@ -619,8 +631,7 @@ if confirm "Install MySQL or MariaDB?"; then
 
         if [[ $? -eq 0 ]]; then
             success "${label} root password set"
-            touch /root/stack-credentials.txt && chmod 600 /root/stack-credentials.txt
-            echo "${label} root password: ${pass1}" >> /root/stack-credentials.txt
+            save_credential "${label} root password" "${pass1}"
         else
             warn "Could not set ${label} root password automatically — set it manually:"
             warn "  sudo mysql_secure_installation"
@@ -733,9 +744,44 @@ if confirm "Install MongoDB?"; then
 
     systemctl enable --now mongod
     check_service mongod "MongoDB"
-    # Port NOT opened in firewall — localhost only is secure default
     info "MongoDB running on port ${MONGO_PORT} (localhost only — not exposed to internet)"
-    warn "Create admin user BEFORE enabling auth — see docs"
+
+    if confirm "Create an admin user and enable authentication now?"; then
+        read -rp "  Enter admin username [admin]: " mongo_user
+        mongo_user="${mongo_user:-admin}"
+        prompt_password "MongoDB admin user '${mongo_user}'"
+        mongo_pass="$PROMPT_PASSWORD"
+
+        # Create the user BEFORE turning on auth — with auth still off,
+        # localhost connections are unauthenticated so this just works.
+        MONGO_SHELL="mongosh"
+        command -v mongosh &>/dev/null || MONGO_SHELL="mongo"
+
+        if "$MONGO_SHELL" --port "$MONGO_PORT" --quiet --eval \
+            "db.getSiblingDB('admin').createUser({user: '${mongo_user}', pwd: '${mongo_pass}', roles: ['root']})" \
+            &>/tmp/stack_install.log; then
+            success "MongoDB admin user '${mongo_user}' created"
+
+            # Now enable authorization and restart so it takes effect
+            if grep -q "^security:" /etc/mongod.conf; then
+                sed -i '/^security:/,/^[^ ]/ s/#\?\s*authorization:.*/  authorization: enabled/' /etc/mongod.conf
+            else
+                printf '\nsecurity:\n  authorization: enabled\n' >> /etc/mongod.conf
+            fi
+            systemctl restart mongod
+            check_service mongod "MongoDB (with auth enabled)"
+            save_credential "MongoDB admin user" "${mongo_user}"
+            save_credential "MongoDB admin password" "${mongo_pass}"
+            info "Connect with: mongosh --port ${MONGO_PORT} -u ${mongo_user} -p --authenticationDatabase admin"
+        else
+            warn "Could not create MongoDB admin user automatically — auth NOT enabled:"
+            cat /tmp/stack_install.log 2>/dev/null | tail -5
+        fi
+        > /tmp/stack_install.log
+    else
+        warn "Auth left disabled — anyone with local/network access to port ${MONGO_PORT} can connect without a password."
+        warn "Create an admin user BEFORE enabling auth — see MongoDB docs."
+    fi
 fi
 
 # ════════════════════════════════════════════════════════════
@@ -808,9 +854,30 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
         pg_lsclusters
     fi
 
-    for PG_NUM in "${INSTALLED_PG_VERSIONS[@]}"; do
-        warn "Set password for PG ${PG_NUM} cluster: sudo -u postgres psql -p <port> -c \"ALTER USER postgres PASSWORD 'PASS';\""
-    done
+    if [[ ${#INSTALLED_PG_VERSIONS[@]} -gt 0 ]]; then
+        if confirm "Set the 'postgres' user password now (same password applied to every installed cluster)?"; then
+            prompt_password "PostgreSQL 'postgres' user"
+            pg_pass="$PROMPT_PASSWORD"
+            for PG_NUM in "${INSTALLED_PG_VERSIONS[@]}"; do
+                pg_port=$(pg_lsclusters | awk -v v="$PG_NUM" '$1==v{print $3; exit}')
+                pg_port="${pg_port:-5432}"
+                if sudo -u postgres psql -p "$pg_port" -c \
+                    "ALTER USER postgres PASSWORD '${pg_pass}';" \
+                    &>/tmp/stack_install.log; then
+                    success "PostgreSQL ${PG_NUM} (port ${pg_port}) — postgres password set"
+                else
+                    warn "Could not set password for PG ${PG_NUM} (port ${pg_port}) automatically:"
+                    cat /tmp/stack_install.log 2>/dev/null | tail -5
+                fi
+            done
+            > /tmp/stack_install.log
+            save_credential "PostgreSQL postgres password (all clusters)" "${pg_pass}"
+        else
+            for PG_NUM in "${INSTALLED_PG_VERSIONS[@]}"; do
+                warn "Set password for PG ${PG_NUM} cluster: sudo -u postgres psql -p <port> -c \"ALTER USER postgres PASSWORD 'PASS';\""
+            done
+        fi
+    fi
 fi
 
 # ════════════════════════════════════════════════════════════
