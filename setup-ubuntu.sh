@@ -581,7 +581,7 @@ fi
 step "STEP 4 — MySQL / MariaDB"
 
 if confirm "Install MySQL or MariaDB?"; then
-    pick_one "Select database server:" \
+    pick_one "Select database server (one only — MySQL/MariaDB share the same port/service and can't run side by side):" \
         "MySQL 8.4 LTS (Recommended)" \
         "MySQL 8.0" \
         "MySQL 5.7 (Legacy)" \
@@ -698,7 +698,7 @@ fi
 step "STEP 5 — MongoDB"
 
 if confirm "Install MongoDB?"; then
-    pick_one "Select MongoDB version:" \
+    pick_one "Select MongoDB version (one only — same package/port, can't run multiple majors side by side via apt):" \
         "MongoDB 8.0 (Latest Stable)" \
         "MongoDB 7.0 (LTS)" \
         "MongoDB 6.0"
@@ -731,14 +731,19 @@ fi
 step "STEP 6 — PostgreSQL"
 
 if confirm "Install PostgreSQL?"; then
-    pick_one "Select PostgreSQL version:" \
+    pick_multi "Select PostgreSQL version(s) to install (these run as separate clusters, side by side, each on its own port):" \
         "PostgreSQL 18 (Latest)" \
         "PostgreSQL 17" \
         "PostgreSQL 16 (LTS)" \
         "PostgreSQL 15" \
         "PostgreSQL 14" \
         "PostgreSQL 13"
-    PG_NUM=$(echo "$PICK" | grep -oP '\d+' | head -1)
+
+    PG_VERSIONS=()
+    for p in "${PICKS[@]}"; do
+        v=$(echo "$p" | grep -oP '\d+' | head -1)
+        PG_VERSIONS+=("$v")
+    done
 
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
@@ -748,10 +753,31 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
 
     # Refresh only pgdg — ignore any unrelated repo errors (e.g. MySQL GPG)
     run_spin "Refreshing apt" apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/pgdg.list"         -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
-    run_spin "Installing PostgreSQL ${PG_NUM}" apt-get install -y -qq         postgresql-${PG_NUM} postgresql-client-${PG_NUM}
+
+    # Install each selected major version. The postgresql-common package
+    # auto-creates a separate cluster per version (pg_createcluster) and
+    # assigns each one the next free port automatically (5432, 5433, ...)
+    # — so multiple major versions genuinely run side by side here.
+    INSTALLED_PG_VERSIONS=()
+    for PG_NUM in "${PG_VERSIONS[@]}"; do
+        if run_spin "Installing PostgreSQL ${PG_NUM}" apt-get install -y -qq \
+            postgresql-${PG_NUM} postgresql-client-${PG_NUM}; then
+            INSTALLED_PG_VERSIONS+=("$PG_NUM")
+        fi
+    done
+
     systemctl enable --now postgresql
-    check_service postgresql "PostgreSQL ${PG_NUM}"
-    warn "Set password: sudo -u postgres psql -c \"ALTER USER postgres PASSWORD 'PASS';\""
+    check_service postgresql "PostgreSQL"
+
+    if command -v pg_lsclusters &>/dev/null; then
+        echo ""
+        info "PostgreSQL clusters (version, port):"
+        pg_lsclusters
+    fi
+
+    for PG_NUM in "${INSTALLED_PG_VERSIONS[@]}"; do
+        warn "Set password for PG ${PG_NUM} cluster: sudo -u postgres psql -p <port> -c \"ALTER USER postgres PASSWORD 'PASS';\""
+    done
 fi
 
 # ════════════════════════════════════════════════════════════
