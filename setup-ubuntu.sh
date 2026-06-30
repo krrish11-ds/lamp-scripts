@@ -270,13 +270,12 @@ fi
 
 run_spin "Installing base tools" apt-get install -y -qq \
     wget curl vim nano git zip unzip tar \
-    net-tools dnsutils lsof htop tree ufw \
+    net-tools dnsutils lsof htop tree \
     software-properties-common gnupg2 \
     ca-certificates lsb-release apt-transport-https
 
-ufw --force enable &>/dev/null
-ufw allow OpenSSH &>/dev/null
-success "UFW enabled + SSH allowed"
+# NOTE: UFW intentionally NOT installed/enabled — firewall management
+# is left to the user / infra layer, per request.
 
 # ════════════════════════════════════════════════════════════
 #  SECTION 3 — Web Server
@@ -292,7 +291,6 @@ WEB_SERVER="$PICK"
 install_apache2() {
     run_spin "Installing Apache2" apt-get install -y -qq apache2
     systemctl enable --now apache2
-    ufw allow 'Apache Full' &>/dev/null
     a2enmod rewrite headers ssl &>/dev/null
     systemctl restart apache2
     check_service apache2 "Apache2"
@@ -300,7 +298,6 @@ install_apache2() {
 install_nginx() {
     run_spin "Installing Nginx" apt-get install -y -qq nginx
     systemctl enable --now nginx
-    ufw allow 'Nginx Full' &>/dev/null
     check_service nginx "Nginx"
 }
 
@@ -317,7 +314,6 @@ case "$WEB_SERVER" in
             sed -i 's/listen \[::\]:80 default_server;/listen [::]:8080 default_server;/' "$NGINX_DEFAULT"
         }
         systemctl enable --now nginx
-        ufw allow 8080/tcp &>/dev/null
         nginx -t &>/dev/null && systemctl restart nginx
         check_service nginx "Nginx (port 8080)"
         ;;
@@ -546,6 +542,23 @@ ${GREEN}  ✔  PHP ${ver} ${label} — extensions done${RESET}              "
         success "PHP ${DEFAULT_PHP} hardened (expose_php off, display_errors off)"
     fi
 
+    # ── Register all installed versions with update-alternatives,
+    #    then set the chosen DEFAULT_PHP as the active `php` CLI binary.
+    #    (We use --set, not --config, since --config waits on an
+    #    interactive prompt and would hang a non-interactive script —
+    #    the user already told us their choice via pick_one above.)
+    info "Configuring 'php' CLI alternative..."
+    ALT_PRIORITY=10
+    for ver in "$DEFAULT_PHP" "${EXTRA_PHP_VERSIONS[@]}"; do
+        bin="/usr/bin/php${ver}"
+        if [[ -x "$bin" ]]; then
+            update-alternatives --install /usr/bin/php php "$bin" "$ALT_PRIORITY" &>/dev/null
+            ALT_PRIORITY=$((ALT_PRIORITY+10))
+        fi
+    done
+    update-alternatives --set php "/usr/bin/php${DEFAULT_PHP}" &>/dev/null
+    success "Default CLI 'php' -> PHP ${DEFAULT_PHP}  (change later with: sudo update-alternatives --config php)"
+
     echo ""
     info "Installed PHP versions summary:"
     echo -e "  ${GREEN}●${RESET} ${BOLD}${DEFAULT_PHP}${RESET} (default/active)"
@@ -567,6 +580,46 @@ if confirm "Install MySQL or MariaDB?"; then
         "MariaDB 10.11 LTS" \
         "MariaDB 11.x (Latest)"
     DB_CHOICE="$PICK"
+
+    # ── Helper: prompt for a root password and apply it ──
+    set_db_root_password() {
+        local service="$1" label="$2"
+        local pass1 pass2
+
+        while true; do
+            read -rsp "  Enter root password for ${label}: " pass1; echo
+            if [[ -z "$pass1" ]]; then
+                echo -e "  ${RED}Password cannot be empty.${RESET}"; continue
+            fi
+            read -rsp "  Confirm password: " pass2; echo
+            if [[ "$pass1" != "$pass2" ]]; then
+                echo -e "  ${RED}Passwords do not match — try again.${RESET}"; continue
+            fi
+            break
+        done
+
+        if [[ "$service" == "mariadb" ]]; then
+            mysql -u root -e \
+                "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('${pass1}'); FLUSH PRIVILEGES;" \
+                2>/tmp/stack_install.log \
+                || mysql -u root -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${pass1}'); FLUSH PRIVILEGES;" 2>/tmp/stack_install.log
+        else
+            mysql -u root -e \
+                "ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '${pass1}'; FLUSH PRIVILEGES;" \
+                2>/tmp/stack_install.log
+        fi
+
+        if [[ $? -eq 0 ]]; then
+            success "${label} root password set"
+            touch /root/stack-credentials.txt && chmod 600 /root/stack-credentials.txt
+            echo "${label} root password: ${pass1}" >> /root/stack-credentials.txt
+        else
+            warn "Could not set ${label} root password automatically — set it manually:"
+            warn "  sudo mysql_secure_installation"
+            cat /tmp/stack_install.log 2>/dev/null | tail -5
+        fi
+        > /tmp/stack_install.log
+    }
 
     # Helper: fix MySQL GPG key (expired key issue on Ubuntu noble)
     fix_mysql_gpg() {
@@ -623,11 +676,11 @@ if confirm "Install MySQL or MariaDB?"; then
     if [[ "$DB_CHOICE" == *"MariaDB"* ]]; then
         systemctl enable --now mariadb
         check_service mariadb "MariaDB"
-        warn "Run: mysql_secure_installation  to set root password"
+        set_db_root_password "mariadb" "MariaDB"
     else
         systemctl enable --now mysql
         check_service mysql "MySQL"
-        warn "Run: mysql_secure_installation  to harden MySQL"
+        set_db_root_password "mysql" "MySQL"
     fi
 fi
 
@@ -690,7 +743,6 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
     run_spin "Installing PostgreSQL ${PG_NUM}" apt-get install -y -qq         postgresql-${PG_NUM} postgresql-client-${PG_NUM}
     systemctl enable --now postgresql
     check_service postgresql "PostgreSQL ${PG_NUM}"
-    ufw allow 5432/tcp &>/dev/null
     warn "Set password: sudo -u postgres psql -c \"ALTER USER postgres PASSWORD 'PASS';\""
 fi
 
@@ -700,12 +752,35 @@ fi
 step "STEP 7 — SSL via Let's Encrypt (Certbot)"
 
 info "Installing Certbot for Let's Encrypt SSL..."
-run_spin "Installing Certbot" apt-get install -y -qq \
-    certbot python3-certbot-apache python3-certbot-nginx
+
+CERTBOT_PKGS=(certbot)
+case "$WEB_SERVER" in
+    "Apache2")
+        CERTBOT_PKGS+=(python3-certbot-apache)
+        ;;
+    "Nginx")
+        CERTBOT_PKGS+=(python3-certbot-nginx)
+        ;;
+    "Both (Apache2 on 80/443, Nginx on 8080)")
+        CERTBOT_PKGS+=(python3-certbot-apache python3-certbot-nginx)
+        ;;
+esac
+
+run_spin "Installing Certbot" apt-get install -y -qq "${CERTBOT_PKGS[@]}"
 success "Certbot installed"
 divider
-info "Apache : certbot --apache  -d yourdomain.com"
-info "Nginx  : certbot --nginx   -d yourdomain.com"
+case "$WEB_SERVER" in
+    "Apache2")
+        info "Apache : certbot --apache  -d yourdomain.com"
+        ;;
+    "Nginx")
+        info "Nginx  : certbot --nginx   -d yourdomain.com"
+        ;;
+    "Both (Apache2 on 80/443, Nginx on 8080)")
+        info "Apache : certbot --apache  -d yourdomain.com"
+        info "Nginx  : certbot --nginx   -d yourdomain.com"
+        ;;
+esac
 info "Renewal: certbot renew --dry-run"
 info "Auto-renewal is enabled via systemd timer automatically"
 
@@ -806,15 +881,8 @@ if command -v nginx &>/dev/null; then
     fi
 fi
 
-# ── 6. Firewall Status ───────────────────────────────────────
-echo -e "\n${BOLD}  6) Firewall (UFW) Rules${RESET}"
-divider
-ufw status 2>/dev/null | grep -E "ALLOW|Status" | while IFS= read -r l; do
-    echo -e "  ${DIM}${l}${RESET}"
-done
-
-# ── 7. Disk & Memory After Install ──────────────────────────
-echo -e "\n${BOLD}  7) Resource Usage After Install${RESET}"
+# ── 6. Disk & Memory After Install ──────────────────────────
+echo -e "\n${BOLD}  6) Resource Usage After Install${RESET}"
 divider
 DISK_USED=$(df -BG / | awk 'NR==2{print $3}')
 DISK_FREE=$(df -BG / | awk 'NR==2{print $4}')
