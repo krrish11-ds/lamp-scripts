@@ -170,7 +170,9 @@ pick_multi() {
         # 'all' shortcut
         if [[ "${raw,,}" == "all" ]]; then
             PICKS=("${opts[@]}")
-            return
+            echo -e "  ${DIM}Selected (ALL):${RESET} ${PICKS[*]}"
+            confirm "  Confirm — install ALL ${n} listed versions?" && return
+            continue
         fi
 
         # normalize: replace commas with spaces
@@ -188,7 +190,12 @@ pick_multi() {
             fi
         done
 
-        $valid && { PICKS=("${selected[@]}"); return; }
+        $valid && {
+            PICKS=("${selected[@]}")
+            echo -e "  ${DIM}Selected:${RESET} ${PICKS[*]}"
+            confirm "  Confirm this selection?" && return
+            continue
+        }
     done
 }
 
@@ -887,10 +894,16 @@ step "STEP 7 — Node.js"
 
 if confirm "Install Node.js?"; then
     pick_multi "Select Node.js version(s) to install:" \
+        "Node 14 (EOL)" \
+        "Node 16 (EOL)" \
         "Node 18 (LTS - Maintenance)" \
+        "Node 19 (EOL)" \
         "Node 20 (LTS)" \
+        "Node 21 (EOL)" \
         "Node 22 (LTS)" \
-        "Node 24 (Current)"
+        "Node 23 (EOL)" \
+        "Node 24 (Current)" \
+        "Node 25 (Latest)"
 
     NODE_VERSIONS=()
     for p in "${PICKS[@]}"; do
@@ -930,7 +943,11 @@ EOF
         done
         > /tmp/stack_install.log
 
-        if [[ ${#INSTALLED_NODE_VERSIONS[@]} -gt 0 ]]; then
+        if [[ ${#INSTALLED_NODE_VERSIONS[@]} -eq 1 ]]; then
+            DEFAULT_NODE="${INSTALLED_NODE_VERSIONS[0]}"
+            info "Only one Node.js version installed — setting ${DEFAULT_NODE} as default automatically."
+            nvm alias default "$DEFAULT_NODE" &>/dev/null
+        elif [[ ${#INSTALLED_NODE_VERSIONS[@]} -gt 1 ]]; then
             echo ""
             DEFAULT_NODE_OPTS=()
             for ver in "${INSTALLED_NODE_VERSIONS[@]}"; do
@@ -939,6 +956,9 @@ EOF
             pick_one "Which installed Node.js version should be the DEFAULT?" "${DEFAULT_NODE_OPTS[@]}"
             DEFAULT_NODE=$(echo "$PICK" | grep -oP '\d+' | head -1)
             nvm alias default "$DEFAULT_NODE" &>/dev/null
+        fi
+
+        if [[ -n "${DEFAULT_NODE:-}" ]]; then
 
             # nvm only works in interactive bash shells. For system-wide
             # access (cron, systemd units, other shells), symlink the
@@ -958,6 +978,24 @@ EOF
                     echo -e "  ${CYAN}●${RESET} ${ver} (installed via nvm)"
                 fi
             done
+        fi
+
+        # ── PM2 (process manager — useful for Node apps, and for Python
+        #    apps too since pm2 can run any interpreter/binary) ──
+        if command -v npm &>/dev/null; then
+            if confirm "Install PM2 globally (process manager for keeping Node/Python apps running)?"; then
+                run_spin "Installing PM2" npm install -g pm2
+                if command -v pm2 &>/dev/null; then
+                    success "PM2 installed: $(pm2 --version 2>/dev/null)"
+                    if confirm "Enable PM2 to auto-start on server reboot?"; then
+                        pm2_startup_cmd=$(pm2 startup systemd -u root --hp /root 2>/dev/null | grep -E '^sudo ' | tail -1)
+                        [[ -n "$pm2_startup_cmd" ]] && eval "${pm2_startup_cmd#sudo }" &>/dev/null
+                        success "PM2 startup hook installed (run 'pm2 save' after starting your apps)"
+                    fi
+                else
+                    warn "PM2 install failed — check: cat /tmp/stack_install.log"
+                fi
+            fi
         fi
     fi
 fi
@@ -993,7 +1031,10 @@ if confirm "Install additional Python version(s)?"; then
             fi
         done
 
-        if [[ ${#INSTALLED_PYTHON_VERSIONS[@]} -gt 0 ]]; then
+        if [[ ${#INSTALLED_PYTHON_VERSIONS[@]} -eq 1 ]]; then
+            DEFAULT_PYTHON="${INSTALLED_PYTHON_VERSIONS[0]}"
+            info "Only one Python version installed — setting ${DEFAULT_PYTHON} as default automatically."
+        elif [[ ${#INSTALLED_PYTHON_VERSIONS[@]} -gt 1 ]]; then
             echo ""
             DEFAULT_PY_OPTS=()
             for ver in "${INSTALLED_PYTHON_VERSIONS[@]}"; do
@@ -1001,7 +1042,9 @@ if confirm "Install additional Python version(s)?"; then
             done
             pick_one "Which installed Python version should the plain 'python' command point to?" "${DEFAULT_PY_OPTS[@]}"
             DEFAULT_PYTHON=$(echo "$PICK" | grep -oP '[\d.]+' | head -1)
+        fi
 
+        if [[ -n "${DEFAULT_PYTHON:-}" ]]; then
             # IMPORTANT: we only ever touch the bare `python` alternative —
             # NEVER `python3`. Ubuntu's apt/system tooling depends on
             # /usr/bin/python3 pointing at the OS-owned interpreter; relinking
