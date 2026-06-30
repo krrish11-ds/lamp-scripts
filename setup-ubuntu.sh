@@ -325,7 +325,7 @@ esac
 step "STEP 3 — PHP"
 
 # All available PHP versions across 7.x and 8.x
-ALL_PHP_VERSIONS=(7.0 7.1 7.2 7.3 7.4 8.0 8.1 8.2 8.3 8.4)
+ALL_PHP_VERSIONS=(7.0 7.1 7.2 7.3 7.4 8.0 8.1 8.2 8.3 8.4 8.5)
 
 if confirm "Install PHP?"; then
 
@@ -342,34 +342,21 @@ https://packages.sury.org/php/ ${OS_CODENAME} main" \
     fi
     run_spin "Refreshing package lists" apt-get update -qq
 
-    # ── Step A: Pick DEFAULT version (single) ──
+    # ── Pick ALL versions to install (multi-select, supports "all") ──
     echo ""
-    pick_one "Select your DEFAULT (active) PHP version:" \
+    pick_multi "Select PHP version(s) to install:" \
         "PHP 7.0" "PHP 7.1" "PHP 7.2" "PHP 7.3" "PHP 7.4" \
-        "PHP 8.0" "PHP 8.1" "PHP 8.2" "PHP 8.3" "PHP 8.4 (Recommended)"
-    DEFAULT_PHP=$(echo "$PICK" | grep -oP '[\d.]+' | head -1)
-    info "Default PHP will be: ${BOLD}${DEFAULT_PHP}${RESET}"
+        "PHP 8.0" "PHP 8.1" "PHP 8.2" "PHP 8.3" "PHP 8.4" "PHP 8.5 (Latest)"
 
-    # ── Step B: Pick ADDITIONAL versions (multi-select) ──
-    echo ""
-    info "Select ADDITIONAL PHP versions to install alongside default:"
-    echo -e "  ${DIM}(These run as separate php-fpm pools — useful for multi-client setups)${RESET}"
-
-    # Build list excluding chosen default
-    EXTRA_OPTS=()
-    for v in "${ALL_PHP_VERSIONS[@]}"; do
-        [[ "$v" == "$DEFAULT_PHP" ]] && continue
-        EXTRA_OPTS+=("PHP ${v}")
-    done
-    EXTRA_OPTS+=("None — only install default")
-
-    pick_multi "Select additional PHP versions:" "${EXTRA_OPTS[@]}"
-    EXTRA_PHP_VERSIONS=()
+    SELECTED_PHP_VERSIONS=()
     for p in "${PICKS[@]}"; do
-        [[ "$p" == "None"* ]] && continue
         ver=$(echo "$p" | grep -oP '[\d.]+' | head -1)
-        EXTRA_PHP_VERSIONS+=("$ver")
+        SELECTED_PHP_VERSIONS+=("$ver")
     done
+
+    if [[ ${#SELECTED_PHP_VERSIONS[@]} -eq 0 ]]; then
+        warn "No PHP version selected — skipping PHP install."
+    fi
 
     # ── Helper: install one PHP version safely ──
     # Tries each extension individually — skips if not available
@@ -480,11 +467,11 @@ https://packages.sury.org/php/ ${OS_CODENAME} main" \
     # apt-get MUST complete fully before systemctl runs
     # so we run installs in foreground and show a simple progress line
     install_php_ver() {
-        local ver="$1" label="$2"
+        local ver="$1"
 
         # Step 1: Install core (cli, fpm, common) — must succeed
         local core_pkgs="php${ver} php${ver}-cli php${ver}-fpm php${ver}-common"
-        echo -ne "${CYAN}  ⠿  Installing PHP ${ver} ${label} (core)...${RESET}"
+        echo -ne "${CYAN}  ⠿  Installing PHP ${ver} (core)...${RESET}"
         > /tmp/stack_install.log
 
         if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $core_pkgs                 >> /tmp/stack_install.log 2>&1; then
@@ -503,7 +490,7 @@ ${RED}  ✘  PHP ${ver} core FAILED${RESET}"
         > /tmp/stack_install.log
         php_install_extensions "$ver"
         echo -e "
-${GREEN}  ✔  PHP ${ver} ${label} — extensions done${RESET}              "
+${GREEN}  ✔  PHP ${ver} — extensions done${RESET}              "
 
         # Show real warnings only
         local warns
@@ -515,56 +502,77 @@ ${GREEN}  ✔  PHP ${ver} ${label} — extensions done${RESET}              "
         enable_php_fpm "$ver"
     }
 
-    install_php_ver "$DEFAULT_PHP" "(default)"
-
-    for ver in "${EXTRA_PHP_VERSIONS[@]}"; do
-        install_php_ver "$ver" "(additional)"
-    done
-
-    # ── Apache + PHP-FPM integration (if Apache installed) ──
-    if systemctl is-active --quiet apache2 2>/dev/null; then
-        info "Enabling Apache proxy_fcgi for PHP-FPM integration..."
-        a2enmod proxy_fcgi setenvif &>/dev/null && systemctl restart apache2 &>/dev/null
-        # Enable fpm conf for default PHP version
-        if a2enconf "php${DEFAULT_PHP}-fpm" &>/dev/null; then
-            systemctl reload apache2 &>/dev/null
-            success "Apache configured to use PHP-FPM ${DEFAULT_PHP} via proxy_fcgi"
-        fi
-    fi
-
-    # ── PHP hardening on default version ──
-    PHP_INI="/etc/php/${DEFAULT_PHP}/fpm/php.ini"
-    if [[ -f "$PHP_INI" ]]; then
-        sed -i 's/^expose_php = On/expose_php = Off/'         "$PHP_INI"
-        sed -i 's/^display_errors = On/display_errors = Off/' "$PHP_INI"
-        sed -i 's/^allow_url_fopen = On/allow_url_fopen = Off/' "$PHP_INI"
-        systemctl restart php${DEFAULT_PHP}-fpm &>/dev/null
-        success "PHP ${DEFAULT_PHP} hardened (expose_php off, display_errors off)"
-    fi
-
-    # ── Register all installed versions with update-alternatives,
-    #    then set the chosen DEFAULT_PHP as the active `php` CLI binary.
-    #    (We use --set, not --config, since --config waits on an
-    #    interactive prompt and would hang a non-interactive script —
-    #    the user already told us their choice via pick_one above.)
-    info "Configuring 'php' CLI alternative..."
-    ALT_PRIORITY=10
-    for ver in "$DEFAULT_PHP" "${EXTRA_PHP_VERSIONS[@]}"; do
-        bin="/usr/bin/php${ver}"
-        if [[ -x "$bin" ]]; then
-            update-alternatives --install /usr/bin/php php "$bin" "$ALT_PRIORITY" &>/dev/null
-            ALT_PRIORITY=$((ALT_PRIORITY+10))
+    INSTALLED_PHP_VERSIONS=()
+    for ver in "${SELECTED_PHP_VERSIONS[@]}"; do
+        if install_php_ver "$ver" ""; then
+            INSTALLED_PHP_VERSIONS+=("$ver")
         fi
     done
-    update-alternatives --set php "/usr/bin/php${DEFAULT_PHP}" &>/dev/null
-    success "Default CLI 'php' -> PHP ${DEFAULT_PHP}  (change later with: sudo update-alternatives --config php)"
 
-    echo ""
-    info "Installed PHP versions summary:"
-    echo -e "  ${GREEN}●${RESET} ${BOLD}${DEFAULT_PHP}${RESET} (default/active)"
-    for ver in "${EXTRA_PHP_VERSIONS[@]}"; do
-        echo -e "  ${CYAN}●${RESET} ${ver} (additional FPM pool)"
-    done
+    if [[ ${#INSTALLED_PHP_VERSIONS[@]} -eq 0 ]]; then
+        warn "No PHP version installed successfully — skipping default selection."
+    else
+        # ── Now that we know what's actually installed, ask which
+        #    one should be the DEFAULT (active) version ──
+        echo ""
+        DEFAULT_OPTS=()
+        for ver in "${INSTALLED_PHP_VERSIONS[@]}"; do
+            DEFAULT_OPTS+=("PHP ${ver}")
+        done
+        pick_one "Which installed PHP version should be the DEFAULT (active) version?" "${DEFAULT_OPTS[@]}"
+        DEFAULT_PHP=$(echo "$PICK" | grep -oP '[\d.]+' | head -1)
+        info "Default PHP set to: ${BOLD}${DEFAULT_PHP}${RESET}"
+
+        # ── Apache + PHP-FPM integration (if Apache installed) ──
+        if systemctl is-active --quiet apache2 2>/dev/null; then
+            info "Enabling Apache proxy_fcgi for PHP-FPM integration..."
+            a2enmod proxy_fcgi setenvif &>/dev/null && systemctl restart apache2 &>/dev/null
+            # Enable fpm conf for default PHP version
+            if a2enconf "php${DEFAULT_PHP}-fpm" &>/dev/null; then
+                systemctl reload apache2 &>/dev/null
+                success "Apache configured to use PHP-FPM ${DEFAULT_PHP} via proxy_fcgi"
+            fi
+        fi
+
+        # ── PHP hardening on default version ──
+        PHP_INI="/etc/php/${DEFAULT_PHP}/fpm/php.ini"
+        if [[ -f "$PHP_INI" ]]; then
+            sed -i 's/^expose_php = On/expose_php = Off/'         "$PHP_INI"
+            sed -i 's/^display_errors = On/display_errors = Off/' "$PHP_INI"
+            sed -i 's/^allow_url_fopen = On/allow_url_fopen = Off/' "$PHP_INI"
+            systemctl restart php${DEFAULT_PHP}-fpm &>/dev/null
+            success "PHP ${DEFAULT_PHP} hardened (expose_php off, display_errors off)"
+        fi
+
+        # ── Register all installed versions with update-alternatives,
+        #    then set the chosen DEFAULT_PHP as the active `php` CLI binary.
+        #    (We use --set, not --config, since --config waits on an
+        #    interactive prompt and would hang a non-interactive script —
+        #    the user already told us their choice via pick_one above.
+        #    Run `sudo update-alternatives --config php` anytime afterward
+        #    to switch interactively.)
+        info "Configuring 'php' CLI alternative..."
+        ALT_PRIORITY=10
+        for ver in "${INSTALLED_PHP_VERSIONS[@]}"; do
+            bin="/usr/bin/php${ver}"
+            if [[ -x "$bin" ]]; then
+                update-alternatives --install /usr/bin/php php "$bin" "$ALT_PRIORITY" &>/dev/null
+                ALT_PRIORITY=$((ALT_PRIORITY+10))
+            fi
+        done
+        update-alternatives --set php "/usr/bin/php${DEFAULT_PHP}" &>/dev/null
+        success "Default CLI 'php' -> PHP ${DEFAULT_PHP}  (change later with: sudo update-alternatives --config php)"
+
+        echo ""
+        info "Installed PHP versions summary:"
+        for ver in "${INSTALLED_PHP_VERSIONS[@]}"; do
+            if [[ "$ver" == "$DEFAULT_PHP" ]]; then
+                echo -e "  ${GREEN}●${RESET} ${BOLD}${ver}${RESET} (default/active)"
+            else
+                echo -e "  ${CYAN}●${RESET} ${ver} (additional FPM pool)"
+            fi
+        done
+    fi
 fi
 
 # ════════════════════════════════════════════════════════════
