@@ -1045,22 +1045,42 @@ if confirm "Install additional Python version(s)?"; then
         fi
 
         if [[ -n "${DEFAULT_PYTHON:-}" ]]; then
-            # IMPORTANT: we only ever touch the bare `python` alternative —
-            # NEVER `python3`. Ubuntu's apt/system tooling depends on
-            # /usr/bin/python3 pointing at the OS-owned interpreter; relinking
-            # it breaks apt and other system scripts. `python3.9`..`python3.14`
-            # binaries remain independently callable regardless of this setting.
+            # Remove ALL existing python alternatives first so stale entries
+            # from previous script runs can't override the user's choice.
+            update-alternatives --remove-all python &>/dev/null || true
+
+            # Re-register only the versions installed in THIS run, assigning
+            # the default version the highest priority so --set is guaranteed.
             ALT_PRIORITY=10
             for ver in "${INSTALLED_PYTHON_VERSIONS[@]}"; do
                 bin="/usr/bin/python${ver}"
                 if [[ -x "$bin" ]]; then
-                    update-alternatives --install /usr/bin/python python "$bin" "$ALT_PRIORITY" &>/dev/null
+                    local prio=$ALT_PRIORITY
+                    [[ "$ver" == "$DEFAULT_PYTHON" ]] && prio=9999
+                    update-alternatives --install /usr/bin/python python "$bin" "$prio" &>/dev/null
                     ALT_PRIORITY=$((ALT_PRIORITY+10))
                 fi
             done
             update-alternatives --set python "/usr/bin/python${DEFAULT_PYTHON}" &>/dev/null
             success "'python' -> Python ${DEFAULT_PYTHON}  (change later with: sudo update-alternatives --config python)"
             info "'python3' is left untouched — it stays the Ubuntu system interpreter."
+
+            # Warn about other python versions on disk not installed this run
+            LEFTOVER_PY=()
+            for bin in /usr/bin/python3.[0-9]*; do
+                ver=$(echo "$bin" | grep -oP '3\.\d+' | head -1)
+                [[ -z "$ver" ]] && continue
+                [[ "$bin" == *-config ]] && continue
+                if ! printf '%s\n' "${INSTALLED_PYTHON_VERSIONS[@]}" | grep -qx "$ver"; then
+                    LEFTOVER_PY+=("$ver")
+                fi
+            done
+            if [[ ${#LEFTOVER_PY[@]} -gt 0 ]]; then
+                warn "These Python versions are on disk from a PREVIOUS script run: ${LEFTOVER_PY[*]}"
+                warn "They do NOT affect the 'python' command (alternatives cleared above) but the binaries"
+                warn "  python${LEFTOVER_PY[0]}, etc. are still callable directly."
+                warn "To remove them:  sudo apt-get purge $(printf 'python%s ' "${LEFTOVER_PY[@]}")"
+            fi
 
             echo ""
             info "Installed Python versions summary:"
