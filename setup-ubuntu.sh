@@ -984,6 +984,8 @@ EOF
         #    apps too since pm2 can run any interpreter/binary) ──
         if command -v npm &>/dev/null; then
             if confirm "Install PM2 globally (process manager for keeping Node/Python apps running)?"; then
+                # libatomic1 is required by Node.js on some Ubuntu 24.04 builds
+                run_spin "Installing libatomic1 (Node.js dependency)" apt-get install -y -qq libatomic1
                 run_spin "Installing PM2" npm install -g pm2
                 if command -v pm2 &>/dev/null; then
                     success "PM2 installed: $(pm2 --version 2>/dev/null)"
